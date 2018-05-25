@@ -1,0 +1,142 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use English;
+
+# for debugging purposes:
+#use Data::Dumper;
+#print Dumper($extinfo);
+
+$ENV{'PATH'} = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+use constant N_OK   => 0;
+use constant N_WARNING    => 1;
+use constant N_CRITICAL   => 2;
+use constant N_MSG => [ "OK", "WARNING", "CRITICAL" ];
+
+my @zpool = ();
+
+sub get_pools() {
+  local *P;
+  my $zpool_cmd = $EUID == 0 ? "zpool" : "sudo zpool";
+  open(P, $zpool_cmd . " list -H 2>&1 |") or &nagios_response("Could not find zpool command", N_CRITICAL);
+  while (<P>) {
+    chomp;
+    my @ret = split(/\s+/, $_);
+    push(@zpool, {
+        'name'   => $ret[0],
+        'health' => $ret[8],
+        'size'   => $ret[1],
+        'alloc'  => $ret[2],
+        'free'   => $ret[3],
+        'frag'   => $ret[5]
+    });
+  }
+  close(P);
+  my $rc = $?;
+  if ($rc != 0) {
+    &nagios_response("zpool list command failed (rc=$rc)", N_CRITICAL);
+  }
+}
+
+sub get_status()
+{
+  my $storage = shift || "unknown";
+  my $cat = 0;
+  my $res = {};
+  local *P;
+  my $zpool_cmd = $EUID == 0 ? "zpool" : "sudo zpool";
+  open(P, $zpool_cmd . " status $storage 2>&1 |") or &nagios_response("Could not find zpool command", N_CRITICAL);
+  while (<P>) {
+    chomp;
+    if ($_ =~ /^\s*([^\s]+):\s*(.*)$/) {
+      $cat = $1;
+      $res->{"$cat"} = ();
+      if ($2) {
+        push(@{$res->{"$cat"}}, $2);
+      }
+    } elsif ($cat && $_ =~ /^\s+(.+)$/) {
+    push(@{$res->{"$cat"}}, $1);
+    }
+  }
+  close(P);
+  my $rc = $?;
+  if ($rc != 0) {
+    &nagios_response("zpool status command failed (rc=$rc)", N_CRITICAL);
+  }
+  return $res;
+}
+
+sub nagios_response()
+{
+  my $msg = shift || "Unknown";
+  my $exit_status = shift;
+  if (!defined($exit_status)) {
+    $exit_status = N_CRITICAL;
+  }
+  printf("%s %s\n", N_MSG->[$exit_status], $msg);
+  exit($exit_status);
+}
+
+sub main() {
+
+  &get_pools();
+  my $exit_status = N_OK;
+  my @out = ();
+  my @out_perf_data = ();
+  foreach my $pool (@zpool) {
+    if ($pool->{'health'} =~ '(DEGRADED|OFFLINE|REMOVED|UNAVAIL)') {
+      $exit_status = ($exit_status < N_WARNING) ? N_WARNING : $exit_status;
+    }
+
+    if ($pool->{'health'} eq 'FAULTED') {
+      $exit_status = N_CRITICAL;
+      push(@out, sprintf("%s(%s)", $pool->{'name'}, $pool->{'health'}));
+    }
+
+    elsif ($pool->{'health'} eq 'ONLINE' or $pool->{'health'} eq 'DEGRADED') {
+      my $extinfo = &get_status($pool->{'name'});
+      my $scanned = 0;
+      my $total = 0;
+      my $speed = 0;
+      my $left  = 0;
+      my $bytes = 0;
+      my $action = 0;
+      my $percent = 0;
+      if (defined($extinfo->{'scan'})) {
+        foreach my $line (@{$extinfo->{'scan'}}) {
+          if ($line =~ /^\s*([^\s]+)\s+scanned out of\s+([^\s]+)\s+at\s+([^\s]+),\s*([^\s]+)\s+to go/) {
+            $scanned = $1;
+            $total = $2;
+            $speed = $3;
+            $left = $4;
+          } elsif ($line =~ /^\s*([^\s]+)\s+(resilvered|repaired),\s*([^\s]+)\s+done/) {
+            $bytes = $1;
+            $action = $2;
+            $percent = $3;
+          }
+        }
+      }
+      if ($scanned && length($scanned) > 2) {
+        if ($pool->{'health'} eq 'ONLINE') {
+          push(@out, sprintf("%s(ONLINE, SCRUB %s,%s,%s)", $pool->{'name'}, $percent, $speed, $left));
+        }
+        elsif ($pool->{'health'} eq 'DEGRADED') {
+          push(@out, sprintf("%s(RESILVER %s,%s,%s)", $pool->{'name'}, $percent, $speed, $left));
+        }
+      } else {
+        push(@out, sprintf("%s(%s)", $pool->{'name'}, $pool->{'health'}));
+      }
+    }
+
+    else {
+      push(@out, sprintf("%s(%s)", $pool->{'name'}, $pool->{'health'}));
+    }
+   
+    push(@out_perf_data, sprintf("%s_alloc=%sB;;; %s_size=%sB;;; %s_frag=%s;;;", $pool->{'name'}, $pool->{'alloc'}, $pool->{'name'}, $pool->{'size'}, $pool->{'name'}, $pool->{'frag'} )  );
+  }
+  &nagios_response(join(",", @out) . " | " . join(" ", @out_perf_data), $exit_status);
+}
+
+&main();
