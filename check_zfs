@@ -30,7 +30,7 @@ sub get_pools() {
         'size'   => $ret[1],
         'alloc'  => $ret[2],
         'free'   => $ret[3],
-        'frag'   => $ret[5]
+        'frag'   => $ret[6]
     });
   }
   close(P);
